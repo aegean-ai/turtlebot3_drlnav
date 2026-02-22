@@ -112,7 +112,7 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
-      - DRLNAV_BASE_PATH=/overlay_ws
+      - DRLNAV_BASE_PATH=/drl_agent
       - DISPLAY=${DISPLAY}
     deploy:
       resources:
@@ -123,7 +123,7 @@ services:
               capabilities: [gpu]
     volumes:
       # Persist trained model checkpoints on the host
-      - ./src/turtlebot3_drl/model:/drl_agent/model
+      - ./src/turtlebot3_drl/model:/drl_agent/src/turtlebot3_drl/model
     depends_on:
       - environment
       - gazebo-goals
@@ -131,7 +131,7 @@ services:
     # DRL_ALGORITHM: ddpg | td3 | dqn
     # Note: No ROS in this container. Agent entry point runs directly via Python.
     command: >
-      python -m drl_agent.drl_agent --mode ${DRL_MODE:-train} --algorithm ${DRL_ALGORITHM:-ddpg}
+      python -m turtlebot3_drl.drl_agent.drl_agent --mode ${DRL_MODE:-train} --algorithm ${DRL_ALGORITHM:-ddpg}
 
   # ---------------------------------------------------------------------------
   # Zenoh router (optional, for multi-host setups)

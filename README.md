@@ -435,10 +435,6 @@ sequenceDiagram
     E->>R: PUB tb/drl/step_response<br/>{"state": [...], "reward": R, "done": D, ...}
     R->>A: deliver
     A->>A: unblock training loop
-
-    style A fill:#0277bd,stroke:#01579b,color:#fff
-    style R fill:#6a1b9a,stroke:#4a148c,color:#fff
-    style E fill:#e65100,stroke:#bf360c,color:#fff
 ```
 
 Episode initialization is signaled by sending an empty action (`"action": []`), which tells the environment to reset episode variables and return the initial observation.
