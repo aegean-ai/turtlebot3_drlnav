@@ -393,8 +393,17 @@ graph TB
     classDef serviceStyle fill:#6a1b9a,stroke:#4a148c,color:#fff,stroke-width:1px
     classDef topicStyle fill:#2e7d32,stroke:#1b5e20,color:#fff,stroke-width:1px
     classDef configStyle fill:#c62828,stroke:#b71c1c,color:#fff,stroke-width:1px
+    classDef agentInternalStyle fill:#01579b,stroke:#0277bd,color:#fff,stroke-width:1px
+    classDef envInternalStyle fill:#00695c,stroke:#004d40,color:#fff,stroke-width:1px
+    classDef goalInternalStyle fill:#bf360c,stroke:#e65100,color:#fff,stroke-width:1px
 
-    class AgentNode,EnvNode,GoalSpawner nodeStyle
+    class AgentNode nodeStyle
+    class EnvNode nodeStyle
+    class GoalSpawner nodeStyle
+    class DDPG,TD3,DQN agentInternalStyle
+    class ReplayBuffer,Storage agentInternalStyle
+    class RewardFn,StateBuilder,CollisionDetect envInternalStyle
+    class GoalModes goalInternalStyle
     class World,Physics,ObstaclePlugin gazeboStyle
     class StepSrv,GoalSrv,SucceedSrv,FailSrv serviceStyle
     class ScanTopic,OdomTopic,VelTopic,GoalPose topicStyle
