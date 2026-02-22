@@ -12,6 +12,16 @@
 * [Installation](#installation)
   * [Docker Installation (recommended)](#docker-installation-recommended)
   * [Manual Installation](#manual-installation)
+* [Architecture](#architecture)
+  * [Zenoh-Decoupled Communication](#zenoh-decoupled-communication)
+* [Deep RL Training: End-to-End Message Flow](#deep-rl-training-end-to-end-message-flow)
+  * [Episode Lifecycle](#episode-lifecycle)
+  * [State Vector Construction](#state-vector-construction-faux-data)
+  * [Action Selection and Execution](#action-selection-and-execution-faux-data)
+  * [Reward Computation](#reward-computation-faux-data)
+  * [DDPG Network Update](#ddpg-network-update-faux-data)
+  * [Episode Outcomes and Terminal Events](#episode-outcomes-and-terminal-events)
+  * [Training Progression Over Episodes](#training-progression-over-episodes-faux-data)
 * [Training](#training)
   * [Loading a Stored Model](#loading-a-stored-model)
   * [Optional Configuration](#optional-configuration)
@@ -468,6 +478,287 @@ Then launch the agent container which connects to the router automatically. The 
 The existing ROS 2 service communication (`/step_comm` using `DrlStep.srv`) is fully preserved. The environment node runs both the ROS 2 service server and the Zenoh step handler simultaneously. If `zenoh-python` is not installed, the environment falls back to ROS 2 only. The standard `DrlAgent` ROS node continues to work unchanged -- Zenoh is only used when running the `ZenohDRLAdapter` agent.
 
 For the full protocol specification (message schemas, timeout handling, error recovery), see [docs/zenoh-step-protocol.md](docs/zenoh-step-protocol.md).
+
+# **Deep RL Training: End-to-End Message Flow**
+
+This section walks through exactly what happens during training, from episode initialization through network weight updates. All data values shown are representative faux data to illustrate the shapes, ranges, and transformations at each stage.
+
+## Episode Lifecycle
+
+A single training episode follows this sequence across the four running nodes:
+
+```mermaid
+sequenceDiagram
+    participant G as Gazebo<br/>(Physics Sim)
+    participant GM as Goal Manager<br/>(gazebo_goals)
+    participant E as Environment<br/>(DRLEnvironment)
+    participant A as Agent<br/>(DrlAgent + DDPG)
+
+    Note over A: Episode starts — agent waits for goal
+    A->>GM: /goal_comm (Goal.srv request)
+    GM-->>A: new_goal = true
+    A->>A: pause_simulation()
+
+    Note over A: Initialize episode — send empty action
+    A->>E: /step_comm { action: [], previous_action: [0, 0] }
+    E->>E: get_state(0, 0) → build 44-dim state vector
+    E->>E: reward_initialize(goal_dist=2.83)
+    E-->>A: { state: [44 floats], reward: 0.0, done: false }
+
+    A->>A: unpause_simulation()
+
+    rect rgb(230, 245, 255)
+        Note over G,A: Training step loop (repeats until done)
+
+        Note over A: Step 1 — random action (observe phase)
+        A->>A: get_action_random() → [0.37, -0.52]
+        A->>E: /step_comm { action: [0.37, -0.52], prev: [0, 0] }
+
+        E->>G: /cmd_vel { linear.x: 0.151, angular.z: -1.04 }
+        G->>E: /scan (40 laser beams)
+        G->>E: /odom (x, y, heading)
+        E->>E: get_state() → 44-dim vector
+        E->>E: get_reward() → -3.71
+        E-->>A: { state: [...], reward: -3.71, done: false }
+
+        A->>A: replay_buffer.add(s, a, r, s', done)
+        Note over A: buffer_size < batch_size: skip training
+
+        Note over A: Step N — learned action (after observe phase)
+        A->>A: actor(state) + OU_noise → [0.82, 0.15]
+        A->>E: /step_comm { action: [0.82, 0.15], prev: [0.37, -0.52] }
+        E->>G: /cmd_vel { linear.x: 0.200, angular.z: 0.30 }
+        G->>E: /scan, /odom
+        E->>E: get_state() → 44-dim vector
+        E->>E: get_reward() → 1.24
+        E-->>A: { state: [...], reward: 1.24, done: false }
+
+        A->>A: replay_buffer.add(s, a, r, s', done)
+        A->>A: sample batch(128) → train actor & critic
+    end
+
+    Note over E: Collision detected (obstacle_dist < 0.13m)
+    E->>E: succeed = COLLISION_WALL, done = true
+    E->>E: stop_reset_robot(success=false)
+    E->>GM: /task_fail (reset goal)
+    E-->>A: { state: [...], reward: -2008.5, done: true }
+
+    A->>A: finish_episode() → log, save model
+    Note over A: Next episode begins
+```
+
+## State Vector Construction (Faux Data)
+
+At every step, the environment builds a **44-dimensional state vector** from sensor readings and goal information. Here is a concrete example showing how raw sensor data is assembled into the state:
+
+```
+Index   Source                  Raw Value       Normalized      Range
+─────   ──────                  ─────────       ──────────      ─────
+[0]     LiDAR beam 0   (0°)    1.75 m          0.500           [0, 1]
+[1]     LiDAR beam 1   (9°)    1.62 m          0.463           [0, 1]
+[2]     LiDAR beam 2  (18°)    0.45 m          0.129           [0, 1]  ← obstacle nearby
+...     (40 beams total, sampled evenly over 360°)
+[38]    LiDAR beam 38 (342°)   3.50 m          1.000           [0, 1]  ← max range
+[39]    LiDAR beam 39 (351°)   2.94 m          0.840           [0, 1]
+─────   ──────                  ─────────       ──────────      ─────
+[40]    Goal distance           2.83 m          0.476           [0, 1]
+[41]    Goal angle              -0.62 rad       -0.197          [-1, 1]
+[42]    Prev linear action      0.82            0.82            [-1, 1]
+[43]    Prev angular action     0.15            0.15            [-1, 1]
+```
+
+LiDAR values are clipped to `LIDAR_DISTANCE_CAP` (3.5 m) and divided by that cap. Goal distance is divided by the arena diagonal (~5.94 m). Goal angle is divided by pi.
+
+## Action Selection and Execution (Faux Data)
+
+Using DDPG as an example, the actor network produces continuous actions which are then transformed into velocity commands:
+
+```
+                          ┌─────────────────────────┐
+  state (44 floats) ─────▶│  Actor Network           │
+                          │  Linear(44, 512) → ReLU  │
+                          │  Linear(512, 512) → ReLU │
+                          │  Linear(512, 2) → tanh   │
+                          └────────┬──────────────────┘
+                                   │
+                          raw action = [0.82, 0.15]
+                                   │
+                          + OU noise (training only)
+                          noise    = [0.03, -0.07]
+                                   │
+                          action   = [0.85, 0.08]    (clamped to [-1, 1])
+                                   │
+                      ┌────────────┴────────────┐
+                      │                         │
+              linear velocity           angular velocity
+              = (0.85 + 1)/2 × 0.22    = 0.08 × 2.0
+              = 0.204 m/s               = 0.16 rad/s
+                      │                         │
+                      └────────────┬────────────┘
+                                   │
+                          /cmd_vel TwistStamped
+                          { linear.x: 0.204,
+                            angular.z: 0.16 }
+```
+
+For **DQN**, the actor selects one of 5 discrete actions (e.g., action index 2) which maps to a predefined `[linear, angular]` pair.
+
+## Reward Computation (Faux Data)
+
+The default reward function `"A"` combines five components. Here is a step where the robot is moving toward the goal but is near an obstacle:
+
+```
+Component        Formula                                  Faux Values        Result
+─────────        ───────                                  ───────────        ──────
+r_yaw            -|goal_angle|                            -|−0.62|           -0.620
+r_distance       2·d₀/(d₀ + d) − 1                      2·2.83/(2.83+2.41)−1  +0.080
+r_obstacle       -20 if min_dist < 0.22m, else 0         min_dist = 0.45    0.000
+r_vlinear        -((0.22 − v_linear) × 10)²              -((0.22−0.204)×10)²  -0.026
+r_vangular       -(v_angular)²                            -(0.16)²           -0.026
+constant         -1 (per-step penalty)                                       -1.000
+─────────                                                                    ──────
+step reward      sum of all components                                       -1.592
+
+Terminal bonuses:
+  SUCCESS         +2500
+  COLLISION       -2000
+```
+
+## DDPG Network Update (Faux Data)
+
+After the observe phase (first 25,000 random-action steps), the agent trains on every step by sampling a mini-batch from the replay buffer:
+
+```mermaid
+sequenceDiagram
+    participant RB as Replay Buffer<br/>(1M capacity)
+    participant C as Critic Network<br/>(state+action → Q)
+    participant CT as Critic Target
+    participant AC as Actor Network<br/>(state → action)
+    participant AT as Actor Target
+
+    Note over RB: Sample batch of 128 transitions<br/>(s, a, r, s', done)
+
+    RB->>AT: s' (next states, 128×44)
+    AT-->>CT: a' = actor_target(s'), 128×2
+    RB->>CT: s' (next states)
+    CT-->>C: Q_next = critic_target(s', a'), 128×1
+
+    Note over C: Q_target = r + γ·(1−done)·Q_next<br/>e.g. -1.59 + 0.99·1·48.2 = 46.12
+
+    RB->>C: s, a (states + actions taken)
+    C->>C: Q_pred = critic(s, a)<br/>e.g. 45.87
+
+    Note over C: critic_loss = SmoothL1(Q_pred, Q_target)<br/>e.g. 0.031
+
+    C->>C: backprop, clip gradients (max_norm=2.0)
+    C->>C: optimizer.step()
+
+    RB->>AC: s (states, 128×44)
+    AC->>AC: a_pred = actor(s), 128×2
+    AC->>C: Q_value = critic(s, a_pred)
+
+    Note over AC: actor_loss = -mean(Q_value)<br/>e.g. -46.05 → maximize Q
+
+    AC->>AC: backprop, clip gradients
+    AC->>AC: optimizer.step()
+
+    Note over AT,CT: Soft update targets:<br/>θ_target = (1−τ)·θ_target + τ·θ<br/>τ = 0.003
+    AC-->>AT: soft_update
+    C-->>CT: soft_update
+```
+
+### Faux Mini-Batch Example
+
+Here is what a single mini-batch looks like in memory (showing 3 of 128 samples):
+
+```
+Sample  State (44-dim)                          Action [lin,ang]  Reward   Next State (44-dim)                     Done
+──────  ──────────────                          ────────────────  ──────   ───────────────────                     ────
+  0     [0.50, 0.46, 0.13, ..., 0.48, -0.20,   [0.85,  0.08]    -1.59    [0.51, 0.44, 0.15, ..., 0.45, -0.15,   false
+         0.82,  0.15]                                                       0.85,  0.08]
+  1     [1.00, 1.00, 0.87, ..., 0.02,  0.95,   [0.91, -0.43]    +2498    [0.00, 0.00, 0.00, ..., 0.00,  0.00,   true
+         0.74, -0.21]                                                       0.00,  0.00]       ← goal reached!
+  2     [0.34, 0.29, 0.04, ..., 0.71,  0.31,   [-0.12,  0.88]   -2006    [0.00, 0.00, 0.00, ..., 0.00,  0.00,   true
+         0.55,  0.60]                                                       0.00,  0.00]       ← collision
+ ...    (128 total)
+```
+
+## Episode Outcomes and Terminal Events
+
+The environment checks for terminal conditions at every step. When triggered, it stops the robot, notifies the goal manager, and returns `done=true` to the agent:
+
+```mermaid
+sequenceDiagram
+    participant E as Environment
+    participant G as Gazebo
+    participant GM as Goal Manager
+
+    alt goal_distance < 0.20m
+        Note over E: SUCCESS
+        E->>E: reward += 2500
+        E->>G: /cmd_vel { linear: 0, angular: 0 }
+        E->>GM: /task_succeed { robot_pose, difficulty_radius×1.01 }
+        GM->>G: delete old goal, spawn new goal
+    else obstacle_distance < 0.13m
+        Note over E: COLLISION (wall or obstacle)
+        E->>E: reward -= 2000
+        E->>G: /cmd_vel { linear: 0, angular: 0 }
+        E->>GM: /task_fail { robot_pose, difficulty_radius×0.99 }
+        GM->>G: delete old goal, spawn new goal
+    else time_sec >= episode_deadline
+        Note over E: TIMEOUT (50 seconds default)
+        E->>G: /cmd_vel { linear: 0, angular: 0 }
+        E->>GM: /task_fail
+    else robot_tilt > 0.06
+        Note over E: TUMBLE
+        E->>G: /cmd_vel { linear: 0, angular: 0 }
+        E->>GM: /task_fail
+    end
+```
+
+## Training Progression Over Episodes (Faux Data)
+
+As training progresses, the agent's behavior changes qualitatively:
+
+```
+Phase             Episodes     Behavior                                     Avg Reward
+─────             ────────     ────────                                     ──────────
+Observe           0            Random actions fill replay buffer             ~ -80
+                               (25,000 steps, no network updates)
+Early training    1-500        Frequent collisions, rarely finds goal        ~ -400
+                               Critic learns rough Q-value landscape
+Mid training      500-3000     Learns obstacle avoidance, sometimes          ~ -20
+                               finds nearby goals, angular control improves
+Late training     3000-6000    Reliable navigation to goals, few             ~ +200
+                               collisions, smooth trajectories
+Converged         6000-8000    Consistent success rate >80%,                 ~ +800
+                               efficient paths, robust to dynamic obstacles
+```
+
+Each row in the training log (`model/[HOSTNAME]/[MODEL_NAME]/_train_stage*.txt`) contains:
+
+```
+episode, reward_sum, outcome, duration, steps, total_steps, buffer_length, avg_critic_loss, avg_actor_loss
+  500,   -412.3,     2,       12.4,     187,   93500,        93500,         0.0342,          -12.45
+ 3000,    -18.7,     1,       23.1,     302,   547200,       547200,        0.0089,          -45.21
+ 6000,    812.4,     1,       31.2,     421,   1000000,      1000000,       0.0034,          -67.83
+```
+
+Where outcome codes are: 0=UNKNOWN, 1=SUCCESS, 2=COLLISION_WALL, 3=COLLISION_OBSTACLE, 4=TIMEOUT, 5=TUMBLE.
+
+## Key Hyperparameters
+
+| Parameter | Value | Role |
+|-----------|-------|------|
+| `OBSERVE_STEPS` | 25,000 | Random-action exploration steps before training begins |
+| `BATCH_SIZE` | 128 | Transitions sampled per gradient update |
+| `BUFFER_SIZE` | 1,000,000 | Replay buffer capacity (FIFO eviction) |
+| `DISCOUNT_FACTOR` (gamma) | 0.99 | Future reward weighting |
+| `LEARNING_RATE` | 0.003 | AdamW optimizer learning rate |
+| `TAU` | 0.003 | Target network soft-update rate |
+| `HIDDEN_SIZE` | 512 | Neurons per hidden layer |
+| `MODEL_STORE_INTERVAL` | 100 | Save checkpoint every N episodes |
+| `EPISODE_TIMEOUT_SECONDS` | 50 | Max wall-clock seconds per episode |
 
 # **Training**
 
