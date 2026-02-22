@@ -286,9 +286,130 @@ For more detailed instructions on ros workspaces check [this guide](https://auto
 
 **Note: Always make sure to first run ```source install/setup.bash``` or open a fresh terminal after building with `colcon build`.**
 
-# **Training**
+# **Architecture**
 
 <img src="media/system_architecture.png" alt="System Architecture" width="700">
+
+```mermaid
+graph TB
+    subgraph Gazebo["Gazebo Simulator"]
+        World["Stage Worlds 1-10<br/><i>Increasing difficulty</i>"]
+        Physics["Physics Engine"]
+        ObstaclePlugin["Obstacle Plugin<br/><i>Dynamic obstacles</i>"]
+    end
+
+    subgraph GazeboGoals["Goal Manager Node<br/><code>gazebo_goals</code>"]
+        GoalSpawner["Goal Spawner<br/><i>DRLGazebo</i>"]
+        GoalModes["Semi-random · True-random · Dynamic"]
+    end
+
+    subgraph Environment["Environment Node<br/><code>environment</code> / <code>real_environment</code>"]
+        EnvNode["DRLEnvironment"]
+        RewardFn["Reward Function<br/><i>reward.py</i>"]
+        StateBuilder["State Builder<br/><i>40 LiDAR + goal dist<br/>+ goal angle + prev actions</i>"]
+        CollisionDetect["Collision / Goal / Timeout<br/>Detection"]
+    end
+
+    subgraph Agent["Agent Node<br/><code>train_agent</code> / <code>test_agent</code>"]
+        AgentNode["DrlAgent"]
+
+        subgraph Algorithms["DRL Algorithms<br/><i>OffPolicyAgent</i>"]
+            DDPG["DDPG<br/><i>Actor-Critic</i>"]
+            TD3["TD3<br/><i>Twin Delayed DDPG</i>"]
+            DQN["DQN<br/><i>5 discrete actions</i>"]
+        end
+
+        ReplayBuffer["Replay Buffer<br/><i>1M samples</i>"]
+        Storage["Storage Manager<br/><i>Weights · Graphs · Logs</i>"]
+    end
+
+    subgraph ROS2Services["ROS2 Service Communication"]
+        StepSrv["/step_comm<br/><i>DrlStep.srv</i>"]
+        GoalSrv["/goal_comm<br/><i>Goal.srv</i>"]
+        SucceedSrv["/task_succeed<br/><i>RingGoal.srv</i>"]
+        FailSrv["/task_fail<br/><i>RingGoal.srv</i>"]
+    end
+
+    subgraph ROS2Topics["ROS2 Topic Subscriptions"]
+        ScanTopic["/scan<br/><i>LaserScan</i>"]
+        OdomTopic["/odom<br/><i>Odometry</i>"]
+        VelTopic["/cmd_vel<br/><i>Twist</i>"]
+        GoalPose["/goal_pose<br/><i>Pose</i>"]
+    end
+
+    subgraph Config["Configuration"]
+        Settings["settings.py<br/><i>Hyperparams · Env constants<br/>· Feature flags</i>"]
+    end
+
+    %% Agent <-> Environment communication
+    AgentNode -- "action" --> StepSrv
+    StepSrv -- "state, reward, done" --> AgentNode
+    AgentNode -- "request goal" --> GoalSrv
+    GoalSrv -- "goal position" --> AgentNode
+
+    %% Environment <-> Gazebo
+    EnvNode --> VelTopic
+    VelTopic --> Gazebo
+    Gazebo --> ScanTopic
+    ScanTopic --> EnvNode
+    Gazebo --> OdomTopic
+    OdomTopic --> EnvNode
+
+    %% Goal management
+    GoalSpawner --> GoalPose
+    GoalPose --> EnvNode
+    EnvNode -- "success" --> SucceedSrv --> GoalSpawner
+    EnvNode -- "failure" --> FailSrv --> GoalSpawner
+    GoalSpawner -- "spawn/delete" --> Gazebo
+
+    %% Internal agent flow
+    AgentNode --> ReplayBuffer
+    ReplayBuffer --> Algorithms
+    Algorithms --> AgentNode
+    AgentNode --> Storage
+
+    %% Environment internals
+    StateBuilder --> EnvNode
+    RewardFn --> EnvNode
+    CollisionDetect --> EnvNode
+
+    %% Config
+    Settings -.-> Agent
+    Settings -.-> Environment
+
+    %% Styling
+    classDef nodeStyle fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
+    classDef gazeboStyle fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
+    classDef serviceStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
+    classDef topicStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
+    classDef configStyle fill:#fce4ec,stroke:#c62828,stroke-width:1px
+
+    class AgentNode,EnvNode,GoalSpawner nodeStyle
+    class World,Physics,ObstaclePlugin gazeboStyle
+    class StepSrv,GoalSrv,SucceedSrv,FailSrv serviceStyle
+    class ScanTopic,OdomTopic,VelTopic,GoalPose topicStyle
+    class Settings configStyle
+```
+
+### Node Overview
+
+| Node | Command | Role |
+|------|---------|------|
+| **Gazebo** | `ros2 launch turtlebot3_gazebo turtlebot3_drl_stage{N}.launch.py` | Physics simulation with stage worlds 1-10 |
+| **Goal Manager** | `ros2 run turtlebot3_drl gazebo_goals` | Spawns/deletes goal markers, manages goal positions |
+| **Environment** | `ros2 run turtlebot3_drl environment` | Bridges Gazebo and Agent — reads sensors, computes reward/state, publishes velocity |
+| **Agent** | `ros2 run turtlebot3_drl train_agent {ddpg,td3,dqn}` | Runs the DRL training/testing loop, selects actions, updates networks |
+
+### Algorithm Comparison
+
+| | DDPG | TD3 | DQN |
+|---|---|---|---|
+| **Action Space** | 2D continuous | 2D continuous | 5 discrete |
+| **Networks** | Actor + Critic | Actor + Twin Critics | Single Q-network |
+| **Exploration** | OU Noise | Policy noise + clipping | Epsilon-greedy |
+| **Key Feature** | Baseline off-policy | Reduced overestimation via twin critics & delayed updates | Simple, discrete |
+
+# **Training**
 
 ## **Running and training the DRL agent!**
 
