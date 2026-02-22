@@ -507,7 +507,7 @@ sequenceDiagram
 
     A->>A: unpause_simulation()
 
-    rect rgb(230, 245, 255)
+    rect rgba(30, 80, 130, 0.3)
         Note over G,A: Training step loop (repeats until done)
 
         Note over A: Step 1 — random action (observe phase)
