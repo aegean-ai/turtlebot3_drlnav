@@ -9,6 +9,7 @@
 
 # **Table of contents**
 * [Introduction](#introduction)
+  * [Origin and Enhancements](#origin-and-enhancements)
 * [Installation](#installation)
   * [Docker Installation (recommended)](#docker-installation-recommended)
   * [Manual Installation](#manual-installation)
@@ -31,7 +32,7 @@
 
 # **Introduction**
 
-This repository contains a ROS2 and PyTorch framework for developing and experimenting with deep reinforcement learning for autonomous navigation on mobile robots. Models are trained in simulation and evaluated either in simulation or on a real-world robot. The robot model used in this repository is based on the turtlebot3. However, the framework can be used for any robot model that can provide LiDAR and odometry information and work with linear velocity messages.
+This repository contains a ROS 2 and PyTorch framework for developing and experimenting with deep reinforcement learning for autonomous navigation on mobile robots. Models are trained in simulation and evaluated either in simulation or on a real-world robot. The robot model used in this repository is based on the TurtleBot3. However, the framework can be used for any robot model that can provide LiDAR and odometry information and work with linear velocity messages.
 
 Below are a few examples of what the current framework can be used for:
 
@@ -40,6 +41,32 @@ Below are a few examples of what the current framework can be used for:
 * Evaluate the effect of different hyperparameters on training time and performance
 * Experiment with additional capabilities (backward motion, frame stacking)
 * Implement your own DRL algorithm (currently includes: DQN, DDPG, TD3)
+
+## Origin and Enhancements
+
+This project was originally forked from [tomasvr/turtlebot3_drlnav](https://github.com/tomasvr/turtlebot3_drlnav), which provided the foundational DRL training framework on ROS 2 Foxy with Gazebo Classic. The repository is now independently developed and maintained by [Aegean AI](https://github.com/aegean-ai) with substantial architectural and infrastructure changes that have diverged significantly from the original codebase.
+
+**Key enhancements over the original:**
+
+| Area | Original | Current |
+|------|----------|---------|
+| **ROS 2 distribution** | Foxy | Jazzy (with Foxy backward compatibility) |
+| **Simulator** | Gazebo Classic (v11) | Gazebo Harmonic (in progress), Gazebo Classic still supported |
+| **PyTorch** | 1.10 | 2.7 |
+| **Agent-Environment coupling** | Single-process ROS 2 service calls only | Zenoh-decoupled architecture — agent runs in a separate container with zero ROS dependencies |
+| **Containerization** | Single Dockerfile | Multi-container `docker-compose` with separate agent, simulation, and Zenoh bridge services |
+| **Communication** | ROS 2 DDS only | Dual-path: ROS 2 services + Zenoh pub/sub with `zenoh-bridge-ros2dds` |
+| **Documentation** | Installation and usage | Full architecture diagrams (Mermaid), end-to-end training flow with faux data, Zenoh protocol specification |
+| **Validation** | Manual testing | Training convergence validation scripts |
+| **Build infrastructure** | Gazebo Classic CMake | Ported to `gz-sim` (Harmonic) CMake targets |
+
+**Summary of changes by category:**
+
+- **Zenoh decoupled architecture**: The PyTorch agent can now run in a lightweight container with only `zenoh-python` and PyTorch — no ROS 2 installation needed. A `ZenohDRLAdapter` replaces the ROS 2 service client, and the environment node runs both ROS 2 and Zenoh handlers simultaneously for backward compatibility.
+- **Gazebo Harmonic port**: World files (SDF), robot and obstacle models, the obstacle plugin (ported from Gazebo Classic API to `gz-sim`), launch files, and bridge configuration have been ported to Gazebo Harmonic.
+- **ROS 2 Jazzy + PyTorch 2.7**: The environment and agent nodes have been updated for ROS 2 Jazzy API changes, and all neural network code is compatible with PyTorch 2.7.
+- **Multi-container Docker infrastructure**: Separate Dockerfiles for the simulation stack (ROS 2 + Gazebo) and the agent container (PyTorch only), orchestrated via `docker-compose.yaml` with Zenoh router and bridge services.
+- **Comprehensive documentation**: Architecture diagrams, inter-node message flow, detailed training walkthrough with faux data showing state vectors, action transformations, reward computation, and DDPG network updates step by step.
 
 # **Installation**
 
