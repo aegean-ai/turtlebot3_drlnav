@@ -73,7 +73,7 @@ class StorageManager:
     def network_load_weights(self, network, model_dir, stage, episode):
         filepath = os.path.join(model_dir, str(network.name) + '_stage'+str(stage)+'_episode'+str(episode)+'.pt')
         print(f"loading: {network.name} model from file: {filepath}")
-        network.load_state_dict(torch.load(filepath, self.map_location))
+        network.load_state_dict(torch.load(filepath, self.map_location, weights_only=True))
 
     def load_graphdata(self):
         with open(os.path.join(self.session_dir, 'stage'+str(self.stage)+'_episode'+str(self.load_episode)+'.pkl'), 'rb') as f:
@@ -106,6 +106,6 @@ class CpuUnpickler(pickle.Unpickler):
         super(CpuUnpickler, self).__init__(file)
     def find_class(self, module, name):
         if module == 'torch.storage' and name == '_load_from_bytes':
-            return lambda b: torch.load(io.BytesIO(b), map_location=self.map_location)
+            return lambda b: torch.load(io.BytesIO(b), map_location=self.map_location, weights_only=True)
         else:
             return super().find_class(module, name)

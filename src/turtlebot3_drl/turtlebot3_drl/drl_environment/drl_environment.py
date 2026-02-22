@@ -20,9 +20,10 @@ import math
 import numpy
 import sys
 import copy
-from numpy.core.numeric import Infinity
+import json
+import threading
 
-from geometry_msgs.msg import Pose, Twist
+from geometry_msgs.msg import Pose, TwistStamped
 from rosgraph_msgs.msg import Clock
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
@@ -38,11 +39,18 @@ from ..common.settings import ENABLE_BACKWARD, EPISODE_TIMEOUT_SECONDS, ENABLE_M
                                 TOPIC_SCAN, TOPIC_VELO, TOPIC_ODOM, ARENA_LENGTH, ARENA_WIDTH, MAX_NUMBER_OBSTACLES, OBSTACLE_RADIUS, LIDAR_DISTANCE_CAP, \
                                     SPEED_LINEAR_MAX, SPEED_ANGULAR_MAX, THRESHOLD_COLLISION, THREHSOLD_GOAL, ENABLE_DYNAMIC_GOALS
 
+try:
+    import zenoh
+    ZENOH_AVAILABLE = True
+except ImportError:
+    ZENOH_AVAILABLE = False
+
 # Automatically retrievew from Gazebo model configuration (40 by default).
 # Can be set manually if needed.
 NUM_SCAN_SAMPLES = util.get_scan_count()
 LINEAR = 0
 ANGULAR = 1
+INFINITY = float('inf')
 MAX_GOAL_DISTANCE = math.sqrt(ARENA_LENGTH**2 + ARENA_WIDTH**2)
 class DRLEnvironment(Node):
     def __init__(self):
@@ -66,11 +74,11 @@ class DRLEnvironment(Node):
 
         self.done = False
         self.succeed = UNKNOWN
-        self.episode_deadline = Infinity
+        self.episode_deadline = INFINITY
         self.reset_deadline = False
         self.clock_msgs_skipped = 0
 
-        self.obstacle_distances = [Infinity] * MAX_NUMBER_OBSTACLES
+        self.obstacle_distances = [INFINITY] * MAX_NUMBER_OBSTACLES
 
         self.new_goal = False
         self.goal_angle = 0.0
@@ -90,7 +98,7 @@ class DRLEnvironment(Node):
         qos = QoSProfile(depth=10)
         qos_clock = QoSProfile(depth=1)
         # publishers
-        self.cmd_vel_pub = self.create_publisher(Twist, self.velo_topic, qos)
+        self.cmd_vel_pub = self.create_publisher(TwistStamped, self.velo_topic, qos)
         # subscribers
         self.goal_pose_sub = self.create_subscription(Pose, self.goal_topic, self.goal_pose_callback, qos)
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, qos)
@@ -104,9 +112,114 @@ class DRLEnvironment(Node):
         self.step_comm_server = self.create_service(DrlStep, 'step_comm', self.step_comm_callback)
         self.goal_comm_server = self.create_service(Goal, 'goal_comm', self.goal_comm_callback)
 
+        # --- Zenoh bridge for container-based agents ---
+        self.zenoh_session = None
+        if ZENOH_AVAILABLE:
+            try:
+                zenoh_config = zenoh.Config()
+                self.zenoh_session = zenoh.open(zenoh_config)
+                self.zenoh_step_pub = self.zenoh_session.declare_publisher('tb/drl/step_response')
+                self.zenoh_step_sub = self.zenoh_session.declare_subscriber(
+                    'tb/drl/step_request', self._zenoh_step_handler)
+                print("[Zenoh] Session opened, subscribed to tb/drl/step_request")
+            except Exception as e:
+                print(f"[Zenoh] Failed to open session: {e}. Zenoh bridge disabled.")
+                self.zenoh_session = None
+        else:
+            print("[Zenoh] zenoh-python not installed, Zenoh bridge disabled.")
+
     """*******************************************************************************
     ** Callback functions and relevant functions
     *******************************************************************************"""
+
+    def _zenoh_step_handler(self, sample):
+        """Handle step requests arriving via Zenoh.
+
+        Expected JSON payload on ``tb/drl/step_request``::
+
+            {
+                "action": [linear, angular],          # empty list [] to init episode
+                "previous_action": [linear, angular]
+            }
+
+        Publishes JSON response on ``tb/drl/step_response``::
+
+            {
+                "state": [...],
+                "reward": float,
+                "done": bool,
+                "success": int,
+                "distance_traveled": float
+            }
+        """
+        try:
+            payload = json.loads(sample.payload.to_string())
+        except Exception as e:
+            print(f"[Zenoh] Bad step_request payload: {e}")
+            return
+
+        action = payload.get("action", [])
+        previous_action = payload.get("previous_action", [0.0, 0.0])
+
+        # --- Initialize episode (empty action) ---
+        if len(action) == 0:
+            self.initial_distance_to_goal = self.goal_distance
+            state = self.get_state(0, 0)
+            rw.reward_initalize(self.initial_distance_to_goal)
+            response_dict = {
+                "state": state,
+                "reward": 0.0,
+                "done": False,
+                "success": UNKNOWN,
+                "distance_traveled": 0.0,
+            }
+            self.zenoh_step_pub.put(json.dumps(response_dict))
+            return
+
+        # --- Normal step ---
+        if ENABLE_MOTOR_NOISE:
+            action[LINEAR] += numpy.clip(numpy.random.normal(0, 0.05), -0.1, 0.1)
+            action[ANGULAR] += numpy.clip(numpy.random.normal(0, 0.05), -0.1, 0.1)
+
+        if ENABLE_BACKWARD:
+            action_linear = action[LINEAR] * SPEED_LINEAR_MAX
+        else:
+            action_linear = (action[LINEAR] + 1) / 2 * SPEED_LINEAR_MAX
+        action_angular = action[ANGULAR] * SPEED_ANGULAR_MAX
+
+        # Publish action cmd
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = action_linear
+        twist.twist.angular.z = action_angular
+        self.cmd_vel_pub.publish(twist)
+
+        # Compute response
+        state = self.get_state(previous_action[LINEAR], previous_action[ANGULAR])
+        reward = rw.get_reward(
+            self.succeed, action_linear, action_angular,
+            self.goal_distance, self.goal_angle, self.obstacle_distance)
+        done = self.done
+        success = self.succeed
+        distance_traveled = 0.0
+
+        if done:
+            distance_traveled = self.total_distance
+            self.succeed = UNKNOWN
+            self.total_distance = 0.0
+            self.local_step = 0
+            self.done = False
+            self.reset_deadline = True
+
+        response_dict = {
+            "state": [float(s) for s in state],
+            "reward": float(reward),
+            "done": bool(done),
+            "success": int(success),
+            "distance_traveled": float(distance_traveled),
+        }
+        self.zenoh_step_pub.put(json.dumps(response_dict))
 
     def goal_pose_callback(self, msg):
         self.goal_x = msg.position.x
@@ -182,8 +295,11 @@ class DRLEnvironment(Node):
         self.clock_msgs_skipped = 0
 
     def stop_reset_robot(self, success):
-        self.cmd_vel_pub.publish(Twist()) # stop robot
-        self.episode_deadline = Infinity
+        stop_msg = TwistStamped()
+        stop_msg.header.stamp = self.get_clock().now().to_msg()
+        stop_msg.header.frame_id = 'base_link'
+        self.cmd_vel_pub.publish(stop_msg) # stop robot
+        self.episode_deadline = INFINITY
         self.done = True
         req = RingGoal.Request()
         req.robot_pose_x = self.robot_x
@@ -258,9 +374,11 @@ class DRLEnvironment(Node):
         action_angular = request.action[ANGULAR] * SPEED_ANGULAR_MAX
 
         # Publish action cmd
-        twist = Twist()
-        twist.linear.x = action_linear
-        twist.angular.z = action_angular
+        twist = TwistStamped()
+        twist.header.stamp = self.get_clock().now().to_msg()
+        twist.header.frame_id = 'base_link'
+        twist.twist.linear.x = action_linear
+        twist.twist.angular.z = action_angular
         self.cmd_vel_pub.publish(twist)
 
         # Prepare repsonse
@@ -291,7 +409,9 @@ def main(args=sys.argv[1:]):
         rclpy.shutdown()
         quit("ERROR: wrong number of arguments!")
     rclpy.spin(drl_environment)
-    drl_environment.destroy()
+    if drl_environment.zenoh_session is not None:
+        drl_environment.zenoh_session.close()
+    drl_environment.destroy_node()
     rclpy.shutdown()
 
 
