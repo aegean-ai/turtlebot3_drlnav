@@ -1,0 +1,78 @@
+# =============================================================================
+# DRL Agent container — GPU-accelerated PyTorch, ZERO ROS dependencies.
+# Communication with the ROS2 simulation is handled entirely via Zenoh + pycdr2.
+# =============================================================================
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+
+ARG USERNAME=vscode
+ARG USER_UID=1001
+ARG USER_GID=$USER_UID
+
+# Create non-root user (eng-ai-agents pattern)
+RUN groupadd --gid $USER_GID $USERNAME \
+  && useradd -s /bin/bash --uid $USER_UID --gid $USER_GID -m $USERNAME \
+  && apt-get update \
+  && apt-get install -y sudo \
+  && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
+  && chmod 0440 /etc/sudoers.d/$USERNAME \
+  && echo "source /usr/share/bash-completion/completions/git" >> /home/$USERNAME/.bashrc \
+  && rm -rf /var/lib/apt/lists/*
+
+# System packages (libgl1 + libglib2.0-0 for opencv, libxcb* for Qt5)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
+  apt-get -y install --no-install-recommends \
+  curl git make bash-completion \
+  libgl1 libglib2.0-0 \
+  libxcb-xinerama0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
+  libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+  && rm -rf /var/lib/apt/lists/*
+
+# uv package manager (eng-ai-agents pattern)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Freeze constraint file to respect base image packages
+RUN mkdir -p /etc/pip \
+  && pip list --format=freeze > /etc/pip/constraint.txt
+
+# Python dependencies — no ROS packages whatsoever
+RUN pip install --no-cache-dir \
+  eclipse-zenoh \
+  pycdr2 \
+  numpy \
+  matplotlib \
+  pandas \
+  pyqtgraph \
+  PyQt5 \
+  opencv-python-headless
+
+# -----------------------------------------------------------------------------
+# Working directory & source code layout
+# -----------------------------------------------------------------------------
+WORKDIR /drl_agent
+
+# Copy DRL agent modules
+COPY src/turtlebot3_drl/turtlebot3_drl/drl_agent/ /drl_agent/drl_agent/
+
+# Copy common utilities (settings, replaybuffer, storagemanager, graph, etc.)
+COPY src/turtlebot3_drl/turtlebot3_drl/common/ /drl_agent/common/
+
+# Copy reward function (imported by off_policy_agent)
+COPY src/turtlebot3_drl/turtlebot3_drl/drl_environment/reward.py /drl_agent/drl_environment/reward.py
+
+# Ensure every sub-directory is a proper Python package
+RUN touch /drl_agent/__init__.py /drl_agent/drl_environment/__init__.py
+
+# Model checkpoint volume mount point
+RUN mkdir -p /drl_agent/model
+VOLUME /drl_agent/model
+
+# -----------------------------------------------------------------------------
+# NVIDIA runtime environment
+# -----------------------------------------------------------------------------
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PYTHONUNBUFFERED=1
+
+# Switch to non-root user
+USER $USERNAME
+RUN git config --global commit.gpgsign false
