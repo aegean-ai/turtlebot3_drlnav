@@ -378,11 +378,11 @@ graph TB
     Settings -.-> Environment
 
     %% Styling
-    classDef nodeStyle fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
-    classDef gazeboStyle fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
-    classDef serviceStyle fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
-    classDef topicStyle fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
-    classDef configStyle fill:#fce4ec,stroke:#c62828,stroke-width:1px
+    classDef nodeStyle fill:#0277bd,stroke:#01579b,color:#fff,stroke-width:2px
+    classDef gazeboStyle fill:#e65100,stroke:#bf360c,color:#fff,stroke-width:2px
+    classDef serviceStyle fill:#6a1b9a,stroke:#4a148c,color:#fff,stroke-width:1px
+    classDef topicStyle fill:#2e7d32,stroke:#1b5e20,color:#fff,stroke-width:1px
+    classDef configStyle fill:#c62828,stroke:#b71c1c,color:#fff,stroke-width:1px
 
     class AgentNode,EnvNode,GoalSpawner nodeStyle
     class World,Physics,ObstaclePlugin gazeboStyle
@@ -408,6 +408,70 @@ graph TB
 | **Networks** | Actor + Critic | Actor + Twin Critics | Single Q-network |
 | **Exploration** | OU Noise | Policy noise + clipping | Epsilon-greedy |
 | **Key Feature** | Baseline off-policy | Reduced overestimation via twin critics & delayed updates | Simple, discrete |
+
+## Zenoh-Decoupled Communication
+
+The standard architecture couples the DRL agent and the simulation environment inside the same ROS 2 graph: the agent is a ROS node that calls the `/step_comm` service on the environment node. This works well for single-machine setups but limits deployment flexibility.
+
+**Zenoh** ([zenoh.io](https://zenoh.io/)) is used to decouple the agent from ROS entirely:
+
+- **Independent containers** -- The PyTorch agent runs in a lightweight container with zero ROS dependencies. Only `zenoh-python` and PyTorch are needed.
+- **Multi-host scaling** -- Agent and simulation can run on different machines (or cloud instances). Zenoh's peer-to-peer protocol handles discovery and transport.
+- **ROS bridge** -- Sensor topics (`/scan`, `/odom`, `/goal_pose`) and velocity commands (`/cmd_vel`) are bridged between ROS 2 DDS and Zenoh by `zenoh-bridge-ros2dds`, which runs alongside the simulation.
+
+### Step Synchronization
+
+The core training loop is a synchronous request-response exchange. The agent publishes an action, the environment computes the next state and reward, and publishes the result back:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Container<br/>(ZenohDRLAdapter)
+    participant R as Zenoh Router
+    participant E as Environment Node<br/>(DRLEnvironment + ROS 2)
+
+    A->>R: PUB tb/drl/step_request<br/>{"action": [lin, ang], ...}
+    R->>E: deliver
+    E->>E: compute state, reward, done
+    E->>R: PUB tb/drl/step_response<br/>{"state": [...], "reward": R, "done": D, ...}
+    R->>A: deliver
+    A->>A: unblock training loop
+
+    style A fill:#0277bd,stroke:#01579b,color:#fff
+    style R fill:#6a1b9a,stroke:#4a148c,color:#fff
+    style E fill:#e65100,stroke:#bf360c,color:#fff
+```
+
+Episode initialization is signaled by sending an empty action (`"action": []`), which tells the environment to reset episode variables and return the initial observation.
+
+### Zenoh Key-Expressions
+
+| Key-Expression | Direction | Encoding | Purpose |
+|---------------|-----------|----------|---------|
+| `rt/scan` | Sim --> Agent | CDR | LiDAR scan (bridged from ROS `/scan`) |
+| `rt/odom` | Sim --> Agent | CDR | Robot odometry (bridged from ROS `/odom`) |
+| `rt/goal_pose` | Sim --> Agent | CDR | Goal position (bridged from ROS `/goal_pose`) |
+| `rt/cmd_vel` | Agent --> Sim | CDR | Velocity commands (bridged to ROS `/cmd_vel`) |
+| `tb/drl/step_request` | Agent --> Env | JSON | Step sync request (`action`, `previous_action`) |
+| `tb/drl/step_response` | Env --> Agent | JSON | Step sync response (`state`, `reward`, `done`, `success`, `distance_traveled`) |
+| `tb/drl/metrics` | Agent --> any | JSON | Training metrics (episode, reward, loss) |
+
+Topics prefixed with `rt/` are bridged by `zenoh-bridge-ros2dds`. Topics prefixed with `tb/` are native Zenoh and not visible on the ROS 2 graph.
+
+### Running with Zenoh
+
+Start the Zenoh router and bridge alongside the simulation:
+
+```bash
+docker compose --profile zenoh up zenoh-router zenoh-bridge
+```
+
+Then launch the agent container which connects to the router automatically. The simulation-side environment node detects `zenoh-python` at startup and opens a parallel Zenoh session alongside its ROS 2 service server.
+
+### Backward Compatibility
+
+The existing ROS 2 service communication (`/step_comm` using `DrlStep.srv`) is fully preserved. The environment node runs both the ROS 2 service server and the Zenoh step handler simultaneously. If `zenoh-python` is not installed, the environment falls back to ROS 2 only. The standard `DrlAgent` ROS node continues to work unchanged -- Zenoh is only used when running the `ZenohDRLAdapter` agent.
+
+For the full protocol specification (message schemas, timeout handling, error recovery), see [docs/zenoh-step-protocol.md](docs/zenoh-step-protocol.md).
 
 # **Training**
 
